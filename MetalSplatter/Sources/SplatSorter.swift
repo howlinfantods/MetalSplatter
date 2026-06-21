@@ -129,7 +129,7 @@ class SplatSorter: @unchecked Sendable {
     /// Called from a background thread.
     var onSortComplete: (@Sendable (TimeInterval) -> Void)?
 
-    // Temporary storage for sorting (reused across iterations, only accessed from sort task)
+    // Temporary storage for CPU sort fallback (reused across iterations, only accessed from sort task)
     private var sortTempStorage: [SplatReferenceAndDepth] = []
 
     private struct SplatReferenceAndDepth {
@@ -137,6 +137,10 @@ class SplatSorter: @unchecked Sendable {
         var splatIndex: UInt32
         var depth: Float
     }
+
+    // GPU sort pipeline — nil if device lacks the Metal library; falls back to CPU path transparently
+    private let gpuSorter: SplatGPUSorter?
+    private let sortCommandQueue: MTLCommandQueue?
 
     // MARK: - Initialization
 
@@ -150,6 +154,8 @@ class SplatSorter: @unchecked Sendable {
         }
 
         self.state = Mutex(State(indexBuffers: indexBuffers))
+        self.gpuSorter = try? SplatGPUSorter(device: device)
+        self.sortCommandQueue = device.makeCommandQueue()
     }
 
     // MARK: - Chunk Management
@@ -589,61 +595,94 @@ class SplatSorter: @unchecked Sendable {
         let totalSplatCount = chunks.reduce(0) { $0 + $1.buffer.count }
         let targetBuffer = state.withLock { $0.indexBuffers[targetBufferIndex].buffer }
 
-        // Phase 1: Read splat positions from all chunks and compute depths
-        // Ensure temp storage is sized correctly
-        if sortTempStorage.count != totalSplatCount {
-            sortTempStorage = Array(repeating: SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0), count: totalSplatCount)
-        }
+        // Phase 1 + 2 + 3: GPU path — depth-key gen → radix sort → ChunkedSplatIndex finalize.
+        // Falls back to single-threaded CPU path if GPU sorter is unavailable.
+        if let sorter = gpuSorter, let queue = sortCommandQueue, totalSplatCount > 0 {
+            // Capture MTLBuffer refs + metadata while isReadingChunks is still true.
+            // We only read the buffer pointer and count here (not splat data), so this is safe —
+            // the chunkGeneration check in Phase 4 detects any concurrent chunk replacement.
+            let gpuChunks = chunks.map {
+                SplatGPUSorter.Chunk(buffer: $0.buffer.buffer, count: $0.buffer.count, chunkIndex: $0.chunkIndex)
+            }
 
-        // Compute depth for each splat across all chunks
-        var tempIndex = 0
-        if SplatRenderer.Constants.sortByDistance {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
-                    tempIndex += 1
+            // Done reading chunks — exclusive access may now proceed.
+            // The captured MTLBuffer refs keep the GPU memory alive through the dispatch.
+            state.withLock { state in
+                state.isReadingChunks = false
+            }
+
+            do {
+                try targetBuffer.ensureCapacity(totalSplatCount)
+                targetBuffer.count = totalSplatCount
+                let outBuffer = targetBuffer.buffer  // capture after possible reallocation
+                guard let cmd = queue.makeCommandBuffer() else {
+                    state.withLock { $0.sortingBufferIndex = nil }
+                    return
                 }
+                try sorter.encode(into: cmd, chunks: gpuChunks,
+                                  cameraPosition: cameraPose.position,
+                                  cameraForward: cameraPose.forward,
+                                  byDistance: SplatRenderer.Constants.sortByDistance,
+                                  out: outBuffer)
+                await withCheckedContinuation { continuation in
+                    cmd.addCompletedHandler { _ in continuation.resume() }
+                    cmd.commit()
+                }
+            } catch {
+                state.withLock { $0.sortingBufferIndex = nil }
+                return
             }
         } else {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
-                    tempIndex += 1
+            // CPU fallback: read splat data, sort in Swift, write ChunkedSplatIndex entries.
+            if sortTempStorage.count != totalSplatCount {
+                sortTempStorage = Array(repeating: SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0), count: totalSplatCount)
+            }
+            var tempIndex = 0
+            if SplatRenderer.Constants.sortByDistance {
+                for chunk in chunks {
+                    for i in 0..<chunk.buffer.count {
+                        let position = chunk.buffer.values[i].position.simd
+                        sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
+                        sortTempStorage[tempIndex].splatIndex = UInt32(i)
+                        sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
+                        tempIndex += 1
+                    }
+                }
+            } else {
+                for chunk in chunks {
+                    for i in 0..<chunk.buffer.count {
+                        let position = chunk.buffer.values[i].position.simd
+                        sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
+                        sortTempStorage[tempIndex].splatIndex = UInt32(i)
+                        sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
+                        tempIndex += 1
+                    }
                 }
             }
-        }
 
-        // Done reading chunks
-        state.withLock { state in
-            state.isReadingChunks = false
-        }
-
-        // Phase 2: Sort by depth (back to front, so larger depth first)
-        sortTempStorage.sort { $0.depth > $1.depth }
-
-        // Phase 3: Write sorted indices to buffer
-        do {
-            try targetBuffer.ensureCapacity(totalSplatCount)
-            targetBuffer.count = totalSplatCount
-            for i in 0..<totalSplatCount {
-                let ref = sortTempStorage[i]
-                targetBuffer.values[i] = ChunkedSplatIndex(
-                    chunkIndex: ref.chunkIndex,
-                    splatIndex: ref.splatIndex
-                )
-            }
-        } catch {
-            // Buffer allocation failed, abort this sort
+            // Done reading chunks
             state.withLock { state in
-                state.sortingBufferIndex = nil
+                state.isReadingChunks = false
             }
-            return
+
+            sortTempStorage.sort { $0.depth > $1.depth }
+
+            do {
+                try targetBuffer.ensureCapacity(totalSplatCount)
+                targetBuffer.count = totalSplatCount
+                for i in 0..<totalSplatCount {
+                    let ref = sortTempStorage[i]
+                    targetBuffer.values[i] = ChunkedSplatIndex(
+                        chunkIndex: ref.chunkIndex,
+                        splatIndex: ref.splatIndex
+                    )
+                }
+            } catch {
+                state.withLock { state in
+                    state.sortingBufferIndex = nil
+                }
+                return
+            }
         }
 
         // Phase 4: Mark buffer as valid (unless invalidation was requested or chunks changed)
