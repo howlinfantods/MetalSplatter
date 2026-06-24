@@ -102,6 +102,10 @@ struct SortKeyParams {
     uint byDistance;   // 1 = squared distance to camera; 0 = dot(position, forward)
     float camX, camY, camZ;
     float fwdX, fwdY, fwdZ;
+    uint keyShift;     // right-shift applied to the 32-bit key to quantize it to (32-keyShift) bits.
+                       // 0 = full 32-bit key (8 passes). For dynamic key width (optimization #2)
+                       // keyShift = 32 - passes*4 keeps the TOP bits, which preserves order
+                       // (right-shift is monotone non-decreasing) so the radix sort needs fewer passes.
 };
 
 // Generates a descending-depth sort key + global-index payload for one chunk.
@@ -129,8 +133,13 @@ kernel void splatDepthKeys(device const float *splatFloats [[buffer(0)]],
     uint bits = as_type<uint>(depth);
     uint mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
     uint asc  = bits ^ mask;              // monotonic float→uint (ascending)
+    uint key  = ~asc;                     // descending depth → ascending key (full 32-bit)
+    // Quantize to (32 - keyShift) bits by keeping the top bits. Right-shift is monotone
+    // non-decreasing, so back-to-front order is preserved exactly; ties collapse within a
+    // bucket and, since the radix sort is stable, hold their (depth-irrelevant) input order.
+    // keyShift == 0 → full 32-bit key, unchanged behaviour.
     uint g = p.baseOffset + i;
-    keysOut[g]    = ~asc;                 // descending depth → ascending key
+    keysOut[g]    = key >> p.keyShift;
     payloadOut[g] = g;                    // payload = global index
 }
 

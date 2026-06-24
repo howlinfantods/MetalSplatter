@@ -79,6 +79,52 @@ final class SplatGPUSorterTests: XCTestCase {
         }
     }
 
+    /// Large-N exercise of the dynamic-key-width path (optimization #2). At 2M splats
+    /// dynamicNumBits → 20 → 5 passes (odd, so the ping-pong parity blit is on the hot path).
+    /// We assert the QUANTIZED key is non-decreasing — the exact invariant the narrowed key
+    /// guarantees (intra-bucket depth spread is unbounded by design, so a raw-depth tolerance
+    /// would be unreliable; quantized-key monotonicity is correct and tight).
+    func testDynamicWidthLargeNQuantizedMonotonic() throws {
+        var rng = SplitMix64(seed: 4242)
+        let n = 2_000_000
+        let numBits = SplatGPUSorter.dynamicNumBits(forCount: n)
+        XCTAssertEqual(numBits, 19)                     // round(log2(500_000)) = 19
+        let passes = SplatGPURadixSort.passCount(forBits: numBits)
+        XCTAssertEqual(passes, 5)                       // ceil(19/4)=5 → odd → blit path
+        let shift = UInt32(32 - passes * SplatGPURadixSort.radixBits)
+
+        let camera = SIMD3<Float>(1, 2, 3)
+        let ps = (0..<n).map { _ in
+            SIMD3<Float>(Float(Int(rng.next() % 8000)) - 4000,
+                         Float(Int(rng.next() % 8000)) - 4000,
+                         Float(Int(rng.next() % 8000)) - 4000)
+        }
+        let chunk = SplatGPUSorter.Chunk(buffer: makeChunkBuffer(positions: ps), count: n, chunkIndex: 0)
+        let sorter = try SplatGPUSorter(device: device)
+        // Explicitly opt into the dynamic (quantized) path — otherwise this runs the exact
+        // 32-bit default and proves nothing about optimization #2.
+        let result = try sorter.sort(chunks: [chunk], cameraPosition: camera,
+                                     cameraForward: SIMD3(0, 0, -1), byDistance: true,
+                                     numBits: SplatGPUSorter.dynamicNumBits(forCount: n))
+        XCTAssertEqual(result.count, n)
+
+        // Reconstruct the same quantized key the kernel produced and assert non-decreasing.
+        func quantizedKey(_ si: UInt32) -> UInt32 {
+            let p = ps[Int(si)] - camera
+            let depth = p.x*p.x + p.y*p.y + p.z*p.z
+            return SplatGPURadixSort.sortableDepthKey(depth, descending: true) >> shift
+        }
+        var lastKey: UInt32 = 0
+        var permutation = Set<UInt32>()
+        for (_, si) in result {
+            let k = quantizedKey(si)
+            XCTAssertGreaterThanOrEqual(k, lastKey, "quantized depth key not monotonic — dynamic-width sort wrong")
+            lastKey = k
+            permutation.insert(si)
+        }
+        XCTAssertEqual(permutation.count, n, "output not a permutation of all splats")
+    }
+
     func testDotProductOrdering() throws {
         var rng = SplitMix64(seed: 22)
         let n = 5000

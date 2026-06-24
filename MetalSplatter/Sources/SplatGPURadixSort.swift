@@ -86,14 +86,28 @@ public final class SplatGPURadixSort {
         }
     }
 
-    /// Encodes the full 8-pass sort into `commandBuffer`. On completion `keys`/`values` hold the result
+    /// Number of 4-bit LSD passes needed to sort `numBits`-wide keys: `ceil(numBits / radixBits)`.
+    public static func passCount(forBits numBits: Int) -> Int {
+        let clamped = max(radixBits, min(32, numBits))
+        return (clamped + radixBits - 1) / radixBits
+    }
+
+    /// Encodes the sort into `commandBuffer`. On completion `keys`/`values` hold the result
     /// (ascending by key); `keys` and `values` must each hold ≥ `count` UInt32 elements.
     ///
-    /// Eight passes is even, so after ping-ponging through the internal scratch the data lands back in
-    /// the caller's `keys`/`values` buffers. Dispatches use the default serial dispatch type, so each
-    /// kernel sees the previous one's writes without explicit barriers.
-    public func encode(into commandBuffer: MTLCommandBuffer, keys: MTLBuffer, values: MTLBuffer, count: Int) throws {
+    /// - Parameter numBits: how many low-order bits of the key are significant. Drives the pass
+    ///   count: `ceil(numBits/4)` of the 4-bit LSD passes are run instead of a hardcoded 8.
+    ///   Defaults to 32 (8 passes) — the full sort, for callers (and tests) that pass general
+    ///   32-bit keys. For a quantized depth key only the low `numBits` carry order, so a 10–20-bit
+    ///   key sorts in 3–5 passes (~37% fewer than 8 for our 1M–16M range). Optimization #2.
+    ///
+    /// Dispatches use the default serial dispatch type, so each kernel sees the previous one's
+    /// writes without explicit barriers. With an odd pass count the data lands in internal scratch
+    /// after ping-ponging, so we blit it back into the caller's buffers to honor the contract.
+    public func encode(into commandBuffer: MTLCommandBuffer, keys: MTLBuffer, values: MTLBuffer,
+                       count: Int, numBits: Int = 32) throws {
         guard count > 1 else { return }
+        let passes = Self.passCount(forBits: numBits)
         let tileCount = (count + tileSize - 1) / tileSize
         try ensureScratch(count: count, tileCount: tileCount)
         guard let scratchKeys, let scratchVals, let histBuffer else { throw Error.bufferAllocationFailed }
@@ -101,7 +115,7 @@ public final class SplatGPURadixSort {
         var srcK = keys, srcV = values
         var dstK = scratchKeys, dstV = scratchVals
 
-        for pass in 0..<Self.passes {
+        for pass in 0..<passes {
             var params = RadixParams(count: UInt32(count),
                                      tileSize: UInt32(tileSize),
                                      tileCount: UInt32(tileCount),
@@ -135,6 +149,19 @@ public final class SplatGPURadixSort {
             enc.endEncoding()
             swap(&srcK, &dstK); swap(&srcV, &dstV)
         }
+
+        // Ping-pong parity: an odd number of passes leaves the sorted data in the internal scratch
+        // buffers (srcK/srcV now alias scratch, not the caller's keys/values). Blit it back so the
+        // method's contract — "keys/values hold the result" — holds for ANY pass count. With the
+        // default 8 (even) passes this is a no-op (srcK === keys), so existing callers/tests are
+        // byte-for-byte unaffected.
+        if srcK !== keys {
+            guard let blit = commandBuffer.makeBlitCommandEncoder() else { throw Error.bufferAllocationFailed }
+            let byteCount = count * MemoryLayout<UInt32>.stride
+            blit.copy(from: srcK, sourceOffset: 0, to: keys,   destinationOffset: 0, size: byteCount)
+            blit.copy(from: srcV, sourceOffset: 0, to: values, destinationOffset: 0, size: byteCount)
+            blit.endEncoding()
+        }
     }
 
     private func dispatch(_ enc: MTLComputeCommandEncoder, pso: MTLComputePipelineState, threads: Int) {
@@ -144,7 +171,7 @@ public final class SplatGPURadixSort {
     }
 
     /// Convenience: sort host arrays in place (creates buffers, runs, blocks). Used by tests and tools.
-    public func sort(keys: inout [UInt32], values: inout [UInt32]) throws {
+    public func sort(keys: inout [UInt32], values: inout [UInt32], numBits: Int = 32) throws {
         let count = keys.count
         guard count > 1, values.count == count else { return }
         guard let kb = device.makeBuffer(bytes: keys, length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
@@ -152,7 +179,7 @@ public final class SplatGPURadixSort {
               let queue = device.makeCommandQueue(),
               let cmd = queue.makeCommandBuffer()
         else { throw Error.bufferAllocationFailed }
-        try encode(into: cmd, keys: kb, values: vb, count: count)
+        try encode(into: cmd, keys: kb, values: vb, count: count, numBits: numBits)
         cmd.commit()
         cmd.waitUntilCompleted()
         let kp = kb.contents().bindMemory(to: UInt32.self, capacity: count)

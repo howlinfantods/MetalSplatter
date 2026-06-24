@@ -32,6 +32,17 @@ public final class SplatGPUSorter {
         var count: UInt32; var baseOffset: UInt32; var byDistance: UInt32
         var camX: Float; var camY: Float; var camZ: Float
         var fwdX: Float; var fwdY: Float; var fwdZ: Float
+        var keyShift: UInt32
+    }
+
+    /// Dynamic radix key width (optimization #2): `numBits = clamp(round(log2(N/4)), 10, 20)`.
+    /// A narrower key needs fewer 4-bit radix passes (`ceil(numBits/4)` of the 8), which is
+    /// ~37% off sort cost across the 1M–16M range. Quantization is done by right-shifting the
+    /// 32-bit depth key to keep its top `passes*4` bits (≥ numBits), which preserves depth order.
+    static func dynamicNumBits(forCount count: Int) -> Int {
+        guard count > 4 else { return 10 }
+        let raw = Int((log2(Double(count) / 4.0)).rounded())
+        return max(10, min(20, raw))
     }
     private struct GatherParams { var count: UInt32; var chunkCount: UInt32 }
 
@@ -63,16 +74,34 @@ public final class SplatGPUSorter {
     /// Encodes the full sort into `commandBuffer`. On completion `out` holds the splats as
     /// `ChunkedSplatIndex` (`uint2(chunkIndex, splatIndex)`, 8 B each) in back-to-front order.
     /// `out` must hold ≥ total-splat-count entries.
+    ///
+    /// - Parameter numBits: dynamic radix key width (optimization #2). Defaults to **32 = exact
+    ///   full-precision sort** so the API and all unit tests get a lossless sort by default. The
+    ///   production caller (`SplatSorter.performSort`) opts into the speed/quality trade by passing
+    ///   `dynamicNumBits(forCount:)`, which keeps only the top `ceil(numBits/4)*4` bits of the depth
+    ///   key and runs `ceil(numBits/4)` of the 8 radix passes (~37% fewer for our 1M–16M range).
+    ///   Quantization is a monotonic float-bit right-shift — order-preserving; intra-bucket ties
+    ///   collapse (depth-irrelevant). At 20 bits on the byDistance live path this resolves to
+    ///   ~0.02% of distance, finer than a splat. (For a directional/dot sort over a wide signed
+    ///   range, a linear min/max-range quantization would be more uniform — noted as a future
+    ///   upgrade; not needed for the live byDistance path.)
     public func encode(into commandBuffer: MTLCommandBuffer,
                        chunks: [Chunk],
                        cameraPosition: SIMD3<Float>,
                        cameraForward: SIMD3<Float>,
                        byDistance: Bool,
-                       out: MTLBuffer) throws {
+                       out: MTLBuffer,
+                       numBits: Int = 32) throws {
         let total = chunks.reduce(0) { $0 + $1.count }
         guard total > 0 else { return }
         try ensureScratch(total)
         guard let keys, let payload else { throw Error.allocationFailed }
+
+        // passes*4 ≥ numBits is the actual key width we keep; keyShift discards the low
+        // 32-(passes*4) bits in the key-gen kernel so the radix sort needs only `passes` of its 8.
+        // Both the key-gen shift and radix.encode must agree on `passes`.
+        let passes = SplatGPURadixSort.passCount(forBits: numBits)
+        let keyShift = UInt32(32 - passes * SplatGPURadixSort.radixBits)
 
         // Per-chunk base offsets + chunk-index table (small, host-built).
         var offsets = [UInt32](repeating: 0, count: chunks.count + 1)
@@ -94,7 +123,8 @@ public final class SplatGPUSorter {
             var kp = SortKeyParams(count: UInt32(c.count), baseOffset: UInt32(running),
                                    byDistance: byDistance ? 1 : 0,
                                    camX: cameraPosition.x, camY: cameraPosition.y, camZ: cameraPosition.z,
-                                   fwdX: cameraForward.x, fwdY: cameraForward.y, fwdZ: cameraForward.z)
+                                   fwdX: cameraForward.x, fwdY: cameraForward.y, fwdZ: cameraForward.z,
+                                   keyShift: keyShift)
             keyEnc.setBuffer(c.buffer, offset: 0, index: 0)
             keyEnc.setBuffer(keys, offset: 0, index: 1)
             keyEnc.setBuffer(payload, offset: 0, index: 2)
@@ -106,8 +136,10 @@ public final class SplatGPUSorter {
         }
         keyEnc.endEncoding()
 
-        // 2. Radix sort (keys, payload) — sorted result lands back in keys/payload.
-        try radix.encode(into: commandBuffer, keys: keys, values: payload, count: total)
+        // 2. Radix sort (keys, payload) — sorted result lands back in keys/payload. Only `passes`
+        // of the 8 LSD passes run (dynamic key width), and the parity blit inside encode() ensures
+        // the result is in keys/payload regardless of whether `passes` is odd or even.
+        try radix.encode(into: commandBuffer, keys: keys, values: payload, count: total, numBits: numBits)
 
         // 3. Finalize: gather sorted global indices into ChunkedSplatIndex.
         guard let gEnc = commandBuffer.makeComputeCommandEncoder() else { throw Error.allocationFailed }
@@ -125,10 +157,12 @@ public final class SplatGPUSorter {
     }
 
     /// Convenience for tests/tools: run + block, returning sorted (chunkIndex, splatIndex) pairs.
+    /// `numBits` defaults to 32 (exact). Pass `dynamicNumBits(forCount:)` to test the quantized path.
     public func sort(chunks: [Chunk],
                      cameraPosition: SIMD3<Float>,
                      cameraForward: SIMD3<Float>,
-                     byDistance: Bool) throws -> [(chunkIndex: UInt16, splatIndex: UInt32)] {
+                     byDistance: Bool,
+                     numBits: Int = 32) throws -> [(chunkIndex: UInt16, splatIndex: UInt32)] {
         let total = chunks.reduce(0) { $0 + $1.count }
         guard total > 0,
               let out = device.makeBuffer(length: total * 8, options: .storageModeShared),
@@ -136,7 +170,7 @@ public final class SplatGPUSorter {
               let cmd = queue.makeCommandBuffer()
         else { return [] }
         try encode(into: cmd, chunks: chunks, cameraPosition: cameraPosition,
-                   cameraForward: cameraForward, byDistance: byDistance, out: out)
+                   cameraForward: cameraForward, byDistance: byDistance, out: out, numBits: numBits)
         cmd.commit(); cmd.waitUntilCompleted()
         let p = out.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: total)
         return (0..<total).map { (UInt16(truncatingIfNeeded: p[$0].x), p[$0].y) }
