@@ -1,7 +1,14 @@
 import Metal
 import simd
+import os
 
 import Synchronization
+
+/// Which code path actually performed a sort. Capture-free diagnostic: on the actual Vision Pro
+/// device the GPU radix pipeline may fail to build (kernels missing from the device metallib,
+/// etc.), silently dropping every frame onto the single-threaded CPU sort of all splats.
+/// `.gpu` vs `.cpu` here is the smoking-gun signal.
+public enum SplatSortPath: String, Sendable { case gpu, cpu }
 
 /**
  SplatSorter creates a sorted list of splat indices across multiple chunks. It is given a reference to
@@ -82,6 +89,32 @@ class SplatSorter: @unchecked Sendable {
 
     private static var bufferCount: Int { 3 }
     private static var pollIntervalNanoseconds: UInt64 { 1_000_000 } // 1ms
+    /// Idle backoff for the sort loop when there is nothing to sort. On visionOS the chunk list
+    /// is never empty post-load, so the loop's exit condition never fires; without this it would
+    /// hot-poll at 1ms (~1000 wakeups/sec) for the whole app lifetime, burning battery/thermal on
+    /// a head-mounted device. Backing off to one frame (~16ms) when idle kills the wakeup storm at
+    /// the cost of ≤~1 frame of resort latency. Does NOT change the loop's exit condition (see L3).
+    private static var idlePollIntervalNanoseconds: UInt64 { 16_000_000 } // ~16ms (one frame)
+
+    // MARK: - Camera-delta re-sort gate (SuperSplat port, optimization #1)
+    //
+    // The single biggest perf lever: a depth sort is only invalidated when the camera moves
+    // enough to change splat ordering. A near-still head should trigger ZERO sorts.
+    //  - Directional sort (dot key): ordering depends only on camera FORWARD direction —
+    //    translation does not change dot(position, forward) order. Gate on forward rotation.
+    //  - byDistance sort (||p - cam||²): ordering depends on camera POSITION. Gate on translation.
+    // SuperSplat uses ~0.001 rad on the forward gate for desktop; we use a larger epsilon to
+    // absorb VR head micro-jitter (which is below the threshold of visible ordering change).
+
+    /// Forward-vector rotation threshold (radians) for the directional-sort gate. ~0.23°.
+    private static let forwardRotationEpsilonRadians: Float = 0.004
+    /// Precomputed cos(epsilon). We trigger when dot(last, cur) < this — cheaper than acos and,
+    /// crucially, NaN-proof (dot can exceed 1.0 by float error; acos(>1) is NaN and any NaN
+    /// comparison is false, so an acos-based gate would silently never fire).
+    private static let forwardRotationCosThreshold: Float = 0.999992 // cos(0.004) ≈ 0.999992
+    /// Position translation threshold (units) for the byDistance-sort gate.
+    private static let positionEpsilon: Float = 0.003
+    private static let positionEpsilonSquared: Float = positionEpsilon * positionEpsilon
 
     // MARK: - Types
 
@@ -105,6 +138,11 @@ class SplatSorter: @unchecked Sendable {
         var pendingInvalidation: Bool = false  // If true, in-progress sort result should be marked invalid
         var cameraPose = CameraPose(position: .zero, forward: SIMD3(0, 0, -1))
         var needsSort: Bool = false
+        /// The camera pose at which we last *triggered* a sort via the camera-delta gate.
+        /// Diffing incoming poses against this (not the per-frame `cameraPose`) prevents
+        /// slow sub-epsilon drift from accumulating unnoticed into a large un-resorted angle.
+        /// `nil` until the gate first fires, so the very first pose always triggers a sort.
+        var lastSortTriggerPose: CameraPose? = nil
         var chunks: [ChunkReference] = []
         var chunkGeneration: UInt64 = 0  // Incremented on chunk changes; prevents stale sorts from overwriting patched buffers
         var isReadingChunks: Bool = false  // True during phase 1 of sort (reading splat positions)
@@ -129,7 +167,18 @@ class SplatSorter: @unchecked Sendable {
     /// Called from a background thread.
     var onSortComplete: (@Sendable (TimeInterval) -> Void)?
 
-    // Temporary storage for sorting (reused across iterations, only accessed from sort task)
+    /// Called when a sort completes, with the path taken, its wall-clock duration, and the
+    /// splat count sorted. Called from a background thread. Bridge this to the on-screen log.
+    var onSortStats: (@Sendable (SplatSortPath, TimeInterval, Int) -> Void)?
+
+    /// True iff the GPU radix sort pipeline successfully built on this device. When false,
+    /// every sort falls back to the single-threaded CPU path — the dominant Vision Pro
+    /// bottleneck. Surface this in the app's log at load time.
+    var gpuSortAvailable: Bool { gpuSorter != nil && sortCommandQueue != nil }
+
+    private static let log = Logger(subsystem: "com.metalsplatter.MetalSplatter", category: "SplatSorter")
+
+    // Temporary storage for CPU sort fallback (reused across iterations, only accessed from sort task)
     private var sortTempStorage: [SplatReferenceAndDepth] = []
 
     private struct SplatReferenceAndDepth {
@@ -137,6 +186,10 @@ class SplatSorter: @unchecked Sendable {
         var splatIndex: UInt32
         var depth: Float
     }
+
+    // GPU sort pipeline — nil if device lacks the Metal library; falls back to CPU path transparently
+    private let gpuSorter: SplatGPUSorter?
+    private let sortCommandQueue: MTLCommandQueue?
 
     // MARK: - Initialization
 
@@ -150,6 +203,21 @@ class SplatSorter: @unchecked Sendable {
         }
 
         self.state = Mutex(State(indexBuffers: indexBuffers))
+
+        // Build the GPU radix-sort pipeline. Do NOT swallow the error: if this fails on the
+        // actual device (e.g. kernels missing from the device metallib → functionNotFound),
+        // we must SEE the real reason — otherwise every frame silently falls back to the
+        // single-threaded CPU sort of all splats. This is the capture-free smoking gun.
+        var builtSorter: SplatGPUSorter? = nil
+        do {
+            builtSorter = try SplatGPUSorter(device: device)
+            Self.log.notice("GPU radix sorter initialized — GPU sort path ENABLED.")
+        } catch {
+            Self.log.error("GPU radix sorter init FAILED — falling back to single-threaded CPU sort every frame. Error: \(String(describing: error), privacy: .public)")
+            builtSorter = nil
+        }
+        self.gpuSorter = builtSorter
+        self.sortCommandQueue = device.makeCommandQueue()
     }
 
     // MARK: - Chunk Management
@@ -320,13 +388,48 @@ class SplatSorter: @unchecked Sendable {
 
     // MARK: - Camera Pose Updates
 
-    /// Updates the camera pose, triggering a new sort if needed.
+    /// Updates the camera pose. Triggers a new sort ONLY when the camera has moved far enough
+    /// to change splat depth ordering (camera-delta gate, SuperSplat optimization #1).
+    ///
+    /// Always records the latest pose (so the next sort uses the freshest camera), but only
+    /// *requests* a sort when the delta exceeds the epsilon for the active sort mode. The gate
+    /// only ever sets `needsSort = true` — it never clears it, so a pending sort requested by a
+    /// chunk add/remove, invalidation, or exclusive-access release is preserved untouched.
     func updateCameraPose(position: SIMD3<Float>, forward: SIMD3<Float>) {
+        var shouldEnsureLoop = false
         state.withLock { state in
-            state.cameraPose = CameraPose(position: position, forward: forward)
-            state.needsSort = true
+            let newPose = CameraPose(position: position, forward: forward)
+            state.cameraPose = newPose
+
+            // Diff against the pose at which we last *triggered* a sort, not the per-frame pose,
+            // so sub-epsilon drift can't accumulate silently into a large un-resorted angle.
+            let moved: Bool
+            if let last = state.lastSortTriggerPose {
+                if SplatRenderer.Constants.sortByDistance {
+                    // Ordering depends on position; gate on translation distance.
+                    let d = newPose.position - last.position
+                    moved = d.lengthSquared > Self.positionEpsilonSquared
+                } else {
+                    // Ordering depends on forward direction; gate on forward rotation.
+                    // dot(a,b) for unit vectors = cos(angle between). cos is monotonically
+                    // decreasing in angle, so dot < cos(eps)  ⇔  angle > eps. NaN-proof.
+                    let c = simd_dot(simd_normalize(newPose.forward), simd_normalize(last.forward))
+                    moved = c < Self.forwardRotationCosThreshold
+                }
+            } else {
+                // No prior trigger: the first pose must always sort.
+                moved = true
+            }
+
+            if moved {
+                state.needsSort = true
+                state.lastSortTriggerPose = newPose
+                shouldEnsureLoop = true
+            }
         }
-        ensureSortLoopRunning()
+        if shouldEnsureLoop {
+            ensureSortLoopRunning()
+        }
     }
 
     // MARK: - Index Buffer Access (Scoped - Preferred)
@@ -406,6 +509,11 @@ class SplatSorter: @unchecked Sendable {
             state.mostRecentValidBufferIndex = nil
             state.needsSort = true
         }
+        // This path sets needsSort=true but, unlike setChunks/addChunkToSort/updateCameraPose,
+        // had no restart call — if the sort loop had already exited, the requested re-sort would
+        // never run, leaving stale depth order. Call OUTSIDE the lock: ensureSortLoopRunning()
+        // takes state.withLock and Mutex is non-reentrant.
+        ensureSortLoopRunning()
     }
 
     // MARK: - Sort Completion Handlers
@@ -562,7 +670,10 @@ class SplatSorter: @unchecked Sendable {
                     return
                 }
 
-                try? await Task.sleep(nanoseconds: Self.pollIntervalNanoseconds)
+                // Idle: nothing to sort right now (sortParams nil / !needsSort), but the loop must
+                // stay alive (chunks never empty on visionOS). Back off to one frame instead of 1ms
+                // to avoid a ~1000 wakeups/sec storm. Exit condition above is unchanged on purpose.
+                try? await Task.sleep(nanoseconds: Self.idlePollIntervalNanoseconds)
                 continue
             }
 
@@ -589,61 +700,112 @@ class SplatSorter: @unchecked Sendable {
         let totalSplatCount = chunks.reduce(0) { $0 + $1.buffer.count }
         let targetBuffer = state.withLock { $0.indexBuffers[targetBufferIndex].buffer }
 
-        // Phase 1: Read splat positions from all chunks and compute depths
-        // Ensure temp storage is sized correctly
-        if sortTempStorage.count != totalSplatCount {
-            sortTempStorage = Array(repeating: SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0), count: totalSplatCount)
-        }
+        // Record which path actually ran, for the capture-free diagnostic stats callback.
+        var sortPath: SplatSortPath = .cpu
 
-        // Compute depth for each splat across all chunks
-        var tempIndex = 0
-        if SplatRenderer.Constants.sortByDistance {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
-                    tempIndex += 1
+        // Phase 1 + 2 + 3: GPU path — depth-key gen → radix sort → ChunkedSplatIndex finalize.
+        // Falls back to single-threaded CPU path if GPU sorter is unavailable.
+        if let sorter = gpuSorter, let queue = sortCommandQueue, totalSplatCount > 0 {
+            sortPath = .gpu
+            // Capture MTLBuffer refs + metadata while isReadingChunks is still true.
+            // We only read the buffer pointer and count here (not splat data), so this is safe —
+            // the chunkGeneration check in Phase 4 detects any concurrent chunk replacement.
+            let gpuChunks = chunks.map {
+                SplatGPUSorter.Chunk(buffer: $0.buffer.buffer, count: $0.buffer.count, chunkIndex: $0.chunkIndex)
+            }
+
+            // Done reading chunks — exclusive access may now proceed.
+            // The captured MTLBuffer refs keep the GPU memory alive through the dispatch.
+            state.withLock { state in
+                state.isReadingChunks = false
+            }
+
+            do {
+                try targetBuffer.ensureCapacity(totalSplatCount)
+                targetBuffer.count = totalSplatCount
+                let outBuffer = targetBuffer.buffer  // capture after possible reallocation
+                guard let cmd = queue.makeCommandBuffer() else {
+                    state.withLock { $0.sortingBufferIndex = nil }
+                    return
                 }
+                // Opt into dynamic key width (optimization #2) on the live path only: a
+                // count-derived numBits runs fewer radix passes (~37% off for 1M–16M). The
+                // convenience/test entry points keep the exact 32-bit default.
+                //
+                // The monotonic float-bit-shift quantization is correctness-safe for the
+                // byDistance key (squared distance ≥ 0, resolution concentrates near the camera).
+                // The directional dot key spans a signed range where low numBits visibly collapses
+                // order (proven by testDotProductOrdering), so we keep FULL precision (32 bits)
+                // there. This makes "directional path stays exact" true by construction, not by
+                // accident of the current `sortByDistance` constant.
+                let numBits = SplatRenderer.Constants.sortByDistance
+                    ? SplatGPUSorter.dynamicNumBits(forCount: totalSplatCount)
+                    : 32
+                try sorter.encode(into: cmd, chunks: gpuChunks,
+                                  cameraPosition: cameraPose.position,
+                                  cameraForward: cameraPose.forward,
+                                  byDistance: SplatRenderer.Constants.sortByDistance,
+                                  out: outBuffer,
+                                  numBits: numBits)
+                await withCheckedContinuation { continuation in
+                    cmd.addCompletedHandler { _ in continuation.resume() }
+                    cmd.commit()
+                }
+            } catch {
+                state.withLock { $0.sortingBufferIndex = nil }
+                return
             }
         } else {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
-                    tempIndex += 1
+            // CPU fallback: read splat data, sort in Swift, write ChunkedSplatIndex entries.
+            if sortTempStorage.count != totalSplatCount {
+                sortTempStorage = Array(repeating: SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0), count: totalSplatCount)
+            }
+            var tempIndex = 0
+            if SplatRenderer.Constants.sortByDistance {
+                for chunk in chunks {
+                    for i in 0..<chunk.buffer.count {
+                        let position = chunk.buffer.values[i].position.simd
+                        sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
+                        sortTempStorage[tempIndex].splatIndex = UInt32(i)
+                        sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
+                        tempIndex += 1
+                    }
+                }
+            } else {
+                for chunk in chunks {
+                    for i in 0..<chunk.buffer.count {
+                        let position = chunk.buffer.values[i].position.simd
+                        sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
+                        sortTempStorage[tempIndex].splatIndex = UInt32(i)
+                        sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
+                        tempIndex += 1
+                    }
                 }
             }
-        }
 
-        // Done reading chunks
-        state.withLock { state in
-            state.isReadingChunks = false
-        }
-
-        // Phase 2: Sort by depth (back to front, so larger depth first)
-        sortTempStorage.sort { $0.depth > $1.depth }
-
-        // Phase 3: Write sorted indices to buffer
-        do {
-            try targetBuffer.ensureCapacity(totalSplatCount)
-            targetBuffer.count = totalSplatCount
-            for i in 0..<totalSplatCount {
-                let ref = sortTempStorage[i]
-                targetBuffer.values[i] = ChunkedSplatIndex(
-                    chunkIndex: ref.chunkIndex,
-                    splatIndex: ref.splatIndex
-                )
-            }
-        } catch {
-            // Buffer allocation failed, abort this sort
+            // Done reading chunks
             state.withLock { state in
-                state.sortingBufferIndex = nil
+                state.isReadingChunks = false
             }
-            return
+
+            sortTempStorage.sort { $0.depth > $1.depth }
+
+            do {
+                try targetBuffer.ensureCapacity(totalSplatCount)
+                targetBuffer.count = totalSplatCount
+                for i in 0..<totalSplatCount {
+                    let ref = sortTempStorage[i]
+                    targetBuffer.values[i] = ChunkedSplatIndex(
+                        chunkIndex: ref.chunkIndex,
+                        splatIndex: ref.splatIndex
+                    )
+                }
+            } catch {
+                state.withLock { state in
+                    state.sortingBufferIndex = nil
+                }
+                return
+            }
         }
 
         // Phase 4: Mark buffer as valid (unless invalidation was requested or chunks changed)
@@ -669,6 +831,7 @@ class SplatSorter: @unchecked Sendable {
         if !wasInvalidated {
             let duration = -startTime.timeIntervalSinceNow
             onSortComplete?(duration)
+            onSortStats?(sortPath, duration, totalSplatCount)
 
             // Fire one-shot sort completion handlers outside the lock
             for handler in completionHandlers {

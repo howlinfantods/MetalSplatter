@@ -75,6 +75,7 @@ fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
     FragmentStore out;
 
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
+    if (alpha < 1.0/255.0) { discard_fragment(); }
     half4 colorWithPremultipliedAlpha = half4(in.color.rgb * alpha, alpha);
 
     half oneMinusAlpha = 1 - alpha;

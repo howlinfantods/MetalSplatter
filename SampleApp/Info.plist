@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>MetalCaptureEnabled</key>
+	<false/>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>MetalSplatter uses world tracking to anchor Gaussian splat scenes to your physical space.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>

@@ -150,6 +150,22 @@ public final class SplatRenderer: @unchecked Sendable {
         set { sorter.onSortComplete = newValue }
     }
 
+    /// The path a sort actually took: GPU radix vs single-threaded CPU fallback.
+    public typealias SortPath = SplatSortPath
+
+    /// Called when a sort completes, with the path taken (`.gpu`/`.cpu`), its wall-clock
+    /// duration, and the splat count sorted. Bridge to an on-screen log for capture-free
+    /// profiling on device. Called from a background thread.
+    public var onSortStats: (@Sendable (SortPath, TimeInterval, Int) -> Void)? {
+        get { sorter.onSortStats }
+        set { sorter.onSortStats = newValue }
+    }
+
+    /// True iff the GPU radix-sort pipeline successfully built on this device. When false,
+    /// every sort runs the single-threaded CPU fallback over all splats — the dominant
+    /// Vision Pro bottleneck. Surface this in the app log at load time.
+    public var gpuSortAvailable: Bool { sorter.gpuSortAvailable }
+
     private let library: MTLLibrary
 
     // MARK: - Chunk Storage

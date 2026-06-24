@@ -89,10 +89,17 @@ final class ChunkTests: XCTestCase {
 final class SplatRendererChunkTests: XCTestCase {
     var device: MTLDevice!
 
-    override func setUp() {
-        super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         device = MTLCreateSystemDefaultDevice()
-        XCTAssertNotNil(device, "Metal device required for tests")
+        guard device != nil else {
+            throw XCTSkip("Metal device unavailable")
+        }
+        // SplatRenderer.init fatalErrors when the compiled metallib is absent (swift test environment).
+        // Skip the whole class rather than crashing the test process.
+        guard (try? device.makeDefaultLibrary(bundle: Bundle.module)) != nil else {
+            throw XCTSkip("Metal default library unavailable in swift test environment — run via Xcode")
+        }
     }
 
     func makeRenderer() throws -> SplatRenderer {

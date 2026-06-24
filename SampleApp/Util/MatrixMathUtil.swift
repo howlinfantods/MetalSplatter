@@ -21,6 +21,13 @@ func matrix4x4_translation(_ translationX: Float, _ translationY: Float, _ trans
                                          vector_float4(translationX, translationY, translationZ, 1)))
 }
 
+func matrix4x4_scale(_ x: Float, _ y: Float, _ z: Float) -> matrix_float4x4 {
+    return matrix_float4x4.init(columns:(vector_float4(x, 0, 0, 0),
+                                         vector_float4(0, y, 0, 0),
+                                         vector_float4(0, 0, z, 0),
+                                         vector_float4(0, 0, 0, 1)))
+}
+
 func matrix_perspective_right_hand(fovyRadians fovy: Float, aspectRatio: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
     let ys = 1 / tanf(fovy * 0.5)
     let xs = ys / aspectRatio
